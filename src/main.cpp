@@ -66,7 +66,7 @@ static void check_for_updates_async() {
     // VERSION_URL: points to your repo's raw VERSION file
     // Update this to match your GitHub repo before building
     FILE* pipe = popen("curl -fsSL --max-time 2 "
-                       "https://raw.githubusercontent.com/MilkmanAbi/ytcui/main/VERSION "
+                       "https://raw.githubusercontent.com/MilkmanAbi/TestRepo/main/VERSION "
                        "2>/dev/null | tr -d '[:space:]'", "r");
     if (!pipe) return;
     char buf[32] = {0};
