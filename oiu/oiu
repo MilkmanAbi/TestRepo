@@ -1,0 +1,569 @@
+#!/usr/bin/env bash
+# ═══════════════════════════════════════════════════════════════════════════════
+# OIU — OneInstallUtility
+# The single entry point for install, uninstall, update, repair, reinstall,
+# clean, status, and info. Drop the oiu/ folder into any project root.
+# ═══════════════════════════════════════════════════════════════════════════════
+
+set -euo pipefail
+
+OIU_VERSION="1.0.0"
+
+# ─── Resolve OIU's own directory (works even via symlink) ─────────────────────
+OIU_DIR="$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}" 2>/dev/null || echo "${BASH_SOURCE[0]}")")" && pwd)"
+export OIU_DIR OIU_VERSION
+
+# ─── Source core modules ──────────────────────────────────────────────────────
+source "$OIU_DIR/core/system.sh"
+source "$OIU_DIR/core/registry.sh"
+source "$OIU_DIR/core/deps.sh"
+source "$OIU_DIR/core/builder.sh"
+source "$OIU_DIR/core/updater.sh"
+source "$OIU_DIR/core/integrate.sh"
+
+# ─── Colors ───────────────────────────────────────────────────────────────────
+if [[ -t 1 ]]; then
+    BOLD='\033[1m'; DIM='\033[2m'
+    CYAN='\033[36m'; GREEN='\033[32m'; YELLOW='\033[33m'; RED='\033[31m'
+    RESET='\033[0m'
+else
+    BOLD=''; DIM=''; CYAN=''; GREEN=''; YELLOW=''; RED=''; RESET=''
+fi
+
+ok()    { echo -e "  ${GREEN}✓${RESET} $*"; }
+warn()  { echo -e "  ${YELLOW}!${RESET} $*"; }
+die()   { echo -e "\n  ${RED}✗ Error:${RESET} $*\n"; exit 1; }
+info()  { echo -e "  ${DIM}→${RESET} $*"; }
+hdr()   { echo -e "\n${BOLD}${CYAN}$*${RESET}\n"; }
+step()  { echo -e "\n${BOLD}[$1] $2${RESET}"; }
+
+# ─── Parse oiu.conf ───────────────────────────────────────────────────────────
+# Finds oiu.conf in the project root (parent of oiu/ directory)
+_oiu_find_conf() {
+    local search_dir
+    search_dir="$(dirname "$OIU_DIR")"   # project root = parent of oiu/
+
+    if [[ -f "$search_dir/oiu.conf" ]]; then
+        echo "$search_dir/oiu.conf"
+    elif [[ -f "./oiu.conf" ]]; then
+        echo "./oiu.conf"
+    else
+        return 1
+    fi
+}
+
+_oiu_parse_conf() {
+    local conf="$1"
+    export OIU_CONF_FILE="$conf"
+    export OIU_CONF_DIR="$(dirname "$conf")"
+
+    # Defaults
+    OIU_APP_NAME=""
+    OIU_APP_DISPLAY_NAME=""
+    OIU_APP_VERSION_FILE=""
+    OIU_APP_GITHUB_REPO=""
+    OIU_APP_BINARY=""
+    OIU_APP_INSTALL_PATH="/usr/local/bin"
+    OIU_APP_UPDATE_MODE="notify"
+    OIU_APP_UPDATE_CHANNEL="stable"
+    OIU_APP_REQUIRE_SUDO="auto"
+    OIU_APP_USER_INSTALL_FALLBACK="true"
+
+    while IFS= read -r line; do
+        line="${line%%#*}"
+        line="${line#"${line%%[![:space:]]*}"}"
+        line="${line%"${line##*[![:space:]]}"}"
+        [[ -z "$line" ]] && continue
+        [[ "$line" =~ ^\[.*\]$ ]] && continue
+
+        local key val
+        key="${line%%=*}"; val="${line#*=}"
+        key="${key%"${key##*[![:space:]]}"}"
+        val="${val#"${val%%[![:space:]]*}"}"
+
+        case "$key" in
+            app_name)                OIU_APP_NAME="$val"                  ;;
+            display_name)            OIU_APP_DISPLAY_NAME="$val"          ;;
+            version_file)            OIU_APP_VERSION_FILE="$val"          ;;
+            github_repo)             OIU_APP_GITHUB_REPO="$val"           ;;
+            binary)                  OIU_APP_BINARY="$val"                ;;
+            install_path)            OIU_APP_INSTALL_PATH="$val"          ;;
+            update_mode)             OIU_APP_UPDATE_MODE="$val"           ;;
+            update_channel)          OIU_APP_UPDATE_CHANNEL="$val"        ;;
+            require_sudo)            OIU_APP_REQUIRE_SUDO="$val"          ;;
+            user_install_fallback)   OIU_APP_USER_INSTALL_FALLBACK="$val" ;;
+        esac
+    done < "$conf"
+
+    [[ -z "$OIU_APP_NAME" ]] && die "oiu.conf: app_name is required"
+    [[ -z "$OIU_APP_BINARY" ]] && OIU_APP_BINARY="$OIU_APP_NAME"
+
+    export OIU_APP_NAME OIU_APP_DISPLAY_NAME OIU_APP_VERSION_FILE
+    export OIU_APP_GITHUB_REPO OIU_APP_BINARY OIU_APP_INSTALL_PATH
+    export OIU_APP_UPDATE_MODE OIU_APP_UPDATE_CHANNEL
+    export OIU_APP_REQUIRE_SUDO OIU_APP_USER_INSTALL_FALLBACK
+}
+
+# ─── Determine install scope ──────────────────────────────────────────────────
+_oiu_resolve_scope() {
+    local force="${1:-}"
+    if [[ "$force" == "system" ]]; then
+        OIU_SCOPE="system"
+    elif [[ "$force" == "user" ]]; then
+        OIU_SCOPE="user"
+    elif [[ "$OIU_IS_ROOT" == "yes" ]]; then
+        OIU_SCOPE="system"
+    elif [[ "$OIU_APP_REQUIRE_SUDO" == "no" ]]; then
+        OIU_SCOPE="user"
+    elif [[ "$OIU_SUDO" != "none" ]]; then
+        OIU_SCOPE="system"
+    elif [[ "$OIU_APP_USER_INSTALL_FALLBACK" == "true" ]]; then
+        OIU_SCOPE="user"
+        warn "No sudo available — installing to ~/.local/bin"
+    else
+        die "No privilege escalation available. Use --user flag or install sudo."
+    fi
+
+    # Adjust install path and registry for scope
+    # Only set OIU_REGISTRY if not already overridden in environment
+    if [[ "$OIU_SCOPE" == "user" ]]; then
+        OIU_APP_INSTALL_PATH="$OIU_HOME/.local/bin"
+        [[ -z "${OIU_REGISTRY_OVERRIDE:-}" ]] && \
+            OIU_REGISTRY="$OIU_HOME/.local/share/oiu/registry.json"
+    else
+        [[ -z "${OIU_REGISTRY_OVERRIDE:-}" ]] && \
+            OIU_REGISTRY="/usr/local/share/oiu/registry.json"
+    fi
+
+    export OIU_SCOPE OIU_APP_INSTALL_PATH OIU_REGISTRY
+}
+
+# ─── Header banner ────────────────────────────────────────────────────────────
+_oiu_banner() {
+    local action="${1:-}"
+    echo ""
+    echo -e "${BOLD}${CYAN}══════════════════════════════════════════${RESET}"
+    printf "${BOLD}${CYAN}  %-38s${RESET}\n" "${OIU_APP_DISPLAY_NAME:-OIU} ${action:+— $action}"
+    printf "${DIM}  %-38s${RESET}\n" "OIU v${OIU_VERSION}  |  ${OIU_OS} ${OIU_ARCH}"
+    echo -e "${BOLD}${CYAN}══════════════════════════════════════════${RESET}"
+    echo ""
+}
+
+# ─── Install ──────────────────────────────────────────────────────────────────
+cmd_install() {
+    _oiu_banner "Installer"
+
+    # System info summary
+    printf "  ${DIM}%-14s${RESET} %s\n" "System:"  "$OIU_OS $OIU_DISTRO $OIU_DISTRO_VERSION $OIU_ARCH"
+    printf "  ${DIM}%-14s${RESET} %s\n" "Package:"  "$OIU_PKG_MANAGER"
+    printf "  ${DIM}%-14s${RESET} %s\n" "Scope:"    "$OIU_SCOPE"
+    printf "  ${DIM}%-14s${RESET} %s\n" "Install:"  "$OIU_APP_INSTALL_PATH/$OIU_APP_BINARY"
+    echo ""
+
+    local binary_dest="$OIU_APP_INSTALL_PATH/$OIU_APP_BINARY"
+
+    # Check if already installed
+    if oiu_registry_has "$OIU_APP_NAME"; then
+        local existing_ver; existing_ver=$(oiu_registry_get "$OIU_APP_NAME" "version")
+        warn "$OIU_APP_NAME v$existing_ver is already installed"
+        echo ""
+        read -rp "  Reinstall? [y/N] " _r
+        echo ""
+        [[ ! "$_r" =~ ^[Yy]$ ]] && { echo "  Tip: run 'oiu update' to upgrade."; echo ""; exit 0; }
+        cmd_uninstall --quiet
+    fi
+
+    # 1. Dependencies
+    step "1/5" "Installing dependencies"
+    oiu_deps_install || die "Dependency installation failed"
+
+    # 2. Build
+    step "2/5" "Building $OIU_APP_NAME"
+    cd "$OIU_CONF_DIR"
+    oiu_builder_load_conf
+    oiu_builder_detect_system
+    oiu_builder_clean 2>/dev/null || true
+    oiu_builder_build || die "Build failed. Run: ./oiu install --debug for details"
+
+    # 3. Find binary
+    local built_binary
+    built_binary=$(oiu_builder_find_binary) || die "Built binary not found. Check builder.conf binary_output"
+    ok "Binary: $built_binary ($(du -sh "$built_binary" 2>/dev/null | cut -f1))"
+
+    # 4. Install binary
+    step "3/5" "Installing"
+    mkdir -p "$OIU_APP_INSTALL_PATH" 2>/dev/null || \
+        $OIU_SUDO mkdir -p "$OIU_APP_INSTALL_PATH"
+
+    if [[ -w "$OIU_APP_INSTALL_PATH" ]]; then
+        cp "$built_binary" "$binary_dest"
+        chmod 755 "$binary_dest"
+    else
+        $OIU_SUDO cp "$built_binary" "$binary_dest"
+        $OIU_SUDO chmod 755 "$binary_dest"
+    fi
+    ok "Binary → $binary_dest"
+
+    # Install --upgrade hook wrapper
+    local upgrade_hook_path="$OIU_APP_INSTALL_PATH/.${OIU_APP_BINARY}-oiu-upgrade"
+    cat > "/tmp/.oiu_upgrade_hook" <<HOOK
+#!/usr/bin/env bash
+# OIU upgrade hook for ${OIU_APP_BINARY} — called by: ${OIU_APP_BINARY} --upgrade
+OIU_REGISTRY="${OIU_REGISTRY}" \
+exec bash "$(dirname "$(readlink -f "$0")")/../oiu/oiu" update "\$@"
+HOOK
+    if [[ -w "$OIU_APP_INSTALL_PATH" ]]; then
+        cp /tmp/.oiu_upgrade_hook "$upgrade_hook_path"
+        chmod 755 "$upgrade_hook_path"
+    else
+        $OIU_SUDO cp /tmp/.oiu_upgrade_hook "$upgrade_hook_path"
+        $OIU_SUDO chmod 755 "$upgrade_hook_path"
+    fi
+    rm -f /tmp/.oiu_upgrade_hook
+    ok "Upgrade hook → $upgrade_hook_path"
+
+    # Read local version
+    local version="unknown"
+    local local_version_file="$OIU_CONF_DIR/VERSION"
+    [[ -f "$local_version_file" ]] && version=$(tr -d '[:space:]' < "$local_version_file")
+
+    # 5. Register in registry (before integrate, so uninstaller can read manifest)
+    oiu_registry_init
+    oiu_registry_write "$OIU_APP_NAME" \
+        version="$version" \
+        binary_path="$binary_dest" \
+        install_scope="$OIU_SCOPE" \
+        update_url="${OIU_APP_VERSION_FILE:-}" \
+        update_mode="$OIU_APP_UPDATE_MODE" \
+        update_channel="$OIU_APP_UPDATE_CHANNEL" \
+        github_repo="${OIU_APP_GITHUB_REPO:-}" \
+        manifest="$binary_dest
+$upgrade_hook_path"
+
+    # 6. Integrate (desktop file, icon, app bundle, uninstaller)
+    step "4/5" "Integrating"
+    oiu_integrate_run "$binary_dest"
+
+    # 7. Done
+    step "5/5" "Done"
+    echo ""
+    echo -e "${BOLD}${GREEN}══════════════════════════════════════════${RESET}"
+    echo -e "${BOLD}${GREEN}  ✓ ${OIU_APP_DISPLAY_NAME:-$OIU_APP_NAME} installed!${RESET}"
+    echo -e "${BOLD}${GREEN}══════════════════════════════════════════${RESET}"
+    echo ""
+    echo "  ${OIU_APP_BINARY}                  start the app"
+    echo "  ${OIU_APP_BINARY} --upgrade         update to latest"
+    echo "  oiu uninstall ${OIU_APP_NAME}        uninstall"
+    echo ""
+
+    # PATH reminder if user install
+    if [[ "$OIU_SCOPE" == "user" ]] && ! echo "$PATH" | grep -q "$OIU_APP_INSTALL_PATH"; then
+        warn "Add to your shell config to use the app:"
+        echo ""
+        echo "    export PATH=\"\$PATH:$OIU_APP_INSTALL_PATH\""
+        echo ""
+    fi
+}
+
+# ─── Uninstall ────────────────────────────────────────────────────────────────
+cmd_uninstall() {
+    local quiet="${1:-}"
+
+    if [[ "$quiet" != "--quiet" ]]; then
+        _oiu_banner "Uninstaller"
+    fi
+
+    oiu_registry_has "$OIU_APP_NAME" || die "$OIU_APP_NAME is not installed (not in OIU registry)"
+
+    local uninstaller; uninstaller=$(oiu_registry_get "$OIU_APP_NAME" "uninstaller" 2>/dev/null || true)
+
+    if [[ -n "$uninstaller" && -f "$uninstaller" ]]; then
+        bash "$uninstaller" ${quiet:+--yes}
+    else
+        # Manual removal from manifest
+        [[ "$quiet" != "--quiet" ]] && {
+            read -rp "  Remove $OIU_APP_NAME? [y/N] " _r
+            echo ""
+            [[ ! "$_r" =~ ^[Yy]$ ]] && { echo "  Cancelled."; exit 0; }
+        }
+
+        oiu_registry_manifest "$OIU_APP_NAME" | while read -r f; do
+            [[ -z "$f" ]] && continue
+            if [[ -f "$f" ]]; then
+                rm -f "$f" 2>/dev/null || $OIU_SUDO rm -f "$f" 2>/dev/null && ok "Removed $f"
+            elif [[ -d "$f" ]]; then
+                rm -rf "$f" 2>/dev/null || $OIU_SUDO rm -rf "$f" 2>/dev/null && ok "Removed $f"
+            fi
+        done
+        oiu_registry_remove "$OIU_APP_NAME"
+        ok "Registry entry removed"
+    fi
+}
+
+# ─── Update ───────────────────────────────────────────────────────────────────
+cmd_update() {
+    local auto_yes=0 channel=""
+
+    for arg in "$@"; do
+        case "$arg" in
+            --yes|-y)     auto_yes=1 ;;
+            --channel=*)  channel="${arg#--channel=}" ;;
+        esac
+    done
+
+    _oiu_banner "Update"
+    oiu_registry_has "$OIU_APP_NAME" || die "$OIU_APP_NAME is not installed"
+
+    oiu_update_run "$OIU_APP_NAME" \
+        ${auto_yes:+--yes} \
+        ${channel:+--channel "$channel"}
+}
+
+# ─── Repair ──────────────────────────────────────────────────────────────────
+cmd_repair() {
+    _oiu_banner "Repair"
+    info "Rebuilding binary, keeping all user data..."
+    echo ""
+
+    oiu_registry_has "$OIU_APP_NAME" || die "$OIU_APP_NAME is not installed"
+
+    local binary_dest; binary_dest=$(oiu_registry_get "$OIU_APP_NAME" "binary_path") || die "Binary path not in registry"
+
+    cd "$OIU_CONF_DIR"
+    oiu_builder_load_conf
+    oiu_builder_detect_system
+    oiu_builder_clean 2>/dev/null || true
+    oiu_builder_build || die "Rebuild failed"
+
+    local built_binary
+    built_binary=$(oiu_builder_find_binary) || die "Built binary not found"
+
+    if [[ -w "$(dirname "$binary_dest")" ]]; then
+        cp "$built_binary" "$binary_dest" && chmod 755 "$binary_dest"
+    else
+        $OIU_SUDO cp "$built_binary" "$binary_dest" && $OIU_SUDO chmod 755 "$binary_dest"
+    fi
+
+    ok "Binary repaired → $binary_dest"
+    echo ""
+}
+
+# ─── Reinstall ───────────────────────────────────────────────────────────────
+cmd_reinstall() {
+    _oiu_banner "Reinstall"
+    info "Full uninstall + clean + reinstall from source"
+
+    read -rp "  Keep user config and data? [Y/n] " _keep
+    echo ""
+    # Uninstall (keeping data if user said yes)
+    if [[ "$_keep" =~ ^[Nn]$ ]]; then
+        local uninstaller; uninstaller=$(oiu_registry_get "$OIU_APP_NAME" "uninstaller" 2>/dev/null || true)
+        [[ -n "$uninstaller" && -f "$uninstaller" ]] && bash "$uninstaller" --yes --purge || \
+            cmd_uninstall --quiet
+    else
+        cmd_uninstall --quiet
+    fi
+
+    # Clean build artifacts
+    cd "$OIU_CONF_DIR"
+    oiu_builder_load_conf
+    oiu_builder_clean 2>/dev/null || true
+
+    # Fresh install
+    cmd_install
+}
+
+# ─── Clean ───────────────────────────────────────────────────────────────────
+cmd_clean() {
+    _oiu_banner "Clean"
+    cd "$OIU_CONF_DIR"
+    oiu_builder_load_conf
+    oiu_builder_detect_system 2>/dev/null || true
+    oiu_builder_clean
+}
+
+# ─── Status ───────────────────────────────────────────────────────────────────
+cmd_status() {
+    _oiu_banner "Status"
+
+    if ! oiu_registry_has "$OIU_APP_NAME"; then
+        echo "  ${YELLOW}$OIU_APP_NAME is not installed${RESET}"
+        echo ""
+        echo "  Run: ./oiu install"
+        echo ""
+        return 0
+    fi
+
+    local ver;     ver=$(oiu_registry_get "$OIU_APP_NAME" "version"      2>/dev/null || echo "?")
+    local bin;     bin=$(oiu_registry_get "$OIU_APP_NAME" "binary_path"  2>/dev/null || echo "?")
+    local scope;   scope=$(oiu_registry_get "$OIU_APP_NAME" "install_scope" 2>/dev/null || echo "?")
+    local mode;    mode=$(oiu_registry_get "$OIU_APP_NAME" "update_mode" 2>/dev/null || echo "?")
+    local uinst;   uinst=$(oiu_registry_get "$OIU_APP_NAME" "uninstaller" 2>/dev/null || echo "?")
+    local date;    date=$(oiu_registry_get "$OIU_APP_NAME" "installed_at" 2>/dev/null | cut -c1-10 || echo "?")
+
+    printf "  ${DIM}%-18s${RESET} %s\n"  "Installed:"    "v$ver  ($date)"
+    printf "  ${DIM}%-18s${RESET} %s\n"  "Binary:"       "$bin  $([ -f "$bin" ] && echo "✓" || echo "${RED}missing${RESET}")"
+    printf "  ${DIM}%-18s${RESET} %s\n"  "Scope:"        "$scope"
+    printf "  ${DIM}%-18s${RESET} %s\n"  "Update mode:"  "$mode"
+    printf "  ${DIM}%-18s${RESET} %s\n"  "Uninstaller:"  "$([ -f "$uinst" ] && echo "✓" || echo "missing")"
+    echo ""
+
+    # Check for update if version_file is set
+    local update_url; update_url=$(oiu_registry_get "$OIU_APP_NAME" "update_url" 2>/dev/null || true)
+    if [[ -n "$update_url" && "$update_url" != "null" ]]; then
+        info "Checking for updates..."
+        if oiu_update_check "$OIU_APP_NAME"; then
+            echo "  ${YELLOW}Update available: $OIU_UPDATE_LOCAL_VERSION → $OIU_UPDATE_REMOTE_VERSION${RESET}"
+            echo "  Run: ./oiu update"
+        else
+            ok "Up to date ($ver)"
+        fi
+    fi
+    echo ""
+}
+
+# ─── Info (system detection dump) ────────────────────────────────────────────
+cmd_info() {
+    _oiu_banner "System Info"
+    bash "$OIU_DIR/core/system.sh"   # runs in "print" mode
+}
+
+# ─── List all OIU-managed apps ───────────────────────────────────────────────
+cmd_list() {
+    echo ""
+    echo -e "${BOLD}OIU-managed apps${RESET}"
+    echo ""
+    printf "  ${DIM}%-20s %-12s %-8s %-35s %s${RESET}\n" "App" "Version" "Scope" "Binary" "Installed"
+    echo "  $(printf '─%.0s' {1..80})"
+    oiu_registry_list
+    echo ""
+}
+
+# ─── Context-aware default (no args) ─────────────────────────────────────────
+cmd_default() {
+    # In CI: default to install quietly
+    if [[ "$OIU_IS_CI" == "yes" ]]; then
+        cmd_install
+        return
+    fi
+
+    if oiu_registry_has "$OIU_APP_NAME" 2>/dev/null; then
+        local ver; ver=$(oiu_registry_get "$OIU_APP_NAME" "version" 2>/dev/null || echo "?")
+
+        # Check for updates
+        local has_update=0
+        local update_url; update_url=$(oiu_registry_get "$OIU_APP_NAME" "update_url" 2>/dev/null || true)
+        if [[ -n "$update_url" && "$update_url" != "null" ]]; then
+            oiu_update_check "$OIU_APP_NAME" 2>/dev/null && has_update=1 || true
+        fi
+
+        _oiu_banner "Installed"
+        printf "  ${DIM}%-14s${RESET} v%s\n" "Version:" "$ver"
+        printf "  ${DIM}%-14s${RESET} %s\n"  "Binary:"  "$(oiu_registry_get "$OIU_APP_NAME" "binary_path" 2>/dev/null)"
+
+        if [[ $has_update -eq 1 ]]; then
+            echo ""
+            echo "  ${YELLOW}Update available: $OIU_UPDATE_LOCAL_VERSION → $OIU_UPDATE_REMOTE_VERSION${RESET}"
+            echo ""
+            read -rp "  What would you like to do? [u]pdate / [r]einstall / [s]tatus / [q]uit: " _choice
+        else
+            echo ""
+            read -rp "  What would you like to do? [r]epair / [R]einstall / [u]ninstall / [s]tatus / [q]uit: " _choice
+        fi
+        echo ""
+
+        case "${_choice,,}" in
+            u) cmd_update ;;
+            r) [[ $has_update -eq 1 ]] && cmd_update || cmd_repair ;;
+            R) cmd_reinstall ;;
+            s) cmd_status ;;
+            uninstall) cmd_uninstall ;;
+            *) echo "  Exiting."; echo "" ;;
+        esac
+    else
+        cmd_install
+    fi
+}
+
+# ─── Usage ────────────────────────────────────────────────────────────────────
+cmd_help() {
+    echo ""
+    echo -e "${BOLD}OIU — OneInstallUtility v${OIU_VERSION}${RESET}"
+    echo ""
+    echo "  Usage: ./oiu [command] [flags]"
+    echo ""
+    echo "  Commands:"
+    echo "    (none)           context-aware: installs if needed, else shows menu"
+    echo "    install          install the app"
+    echo "    uninstall        remove the app completely"
+    echo "    update           update to latest version"
+    echo "    repair           rebuild + reinstall binary only, keep user data"
+    echo "    reinstall        full uninstall + clean + fresh install"
+    echo "    clean            remove build artifacts"
+    echo "    status           show version, install info, update availability"
+    echo "    info             show system detection details"
+    echo "    list             show all OIU-managed apps on this system"
+    echo "    help             show this help"
+    echo ""
+    echo "  Flags:"
+    printf "    %-28s %s\n" "--user"           "install to ~/.local/bin (no sudo)"
+    printf "    %-28s %s\n" "--system"         "install to /usr/local/bin (requires sudo)"
+    printf "    %-28s %s\n" "--yes, -y"        "skip confirmation prompts"
+    printf "    %-28s %s\n" "--dry-run"        "show what would happen, do nothing"
+    printf "    %-28s %s\n" "--debug"          "verbose output"
+    printf "    %-28s %s\n" "--channel=NAME"   "use update channel (stable/beta/nightly/branch)"
+    printf "    %-28s %s\n" "--no-update-check" "skip version check"
+    printf "    %-28s %s\n" "--version"        "print OIU version"
+    echo ""
+}
+
+# ─── Main ─────────────────────────────────────────────────────────────────────
+main() {
+    local command="" force_scope="" dry_run=0 debug=0 extra_args=()
+
+    # Preserve OIU_REGISTRY if set externally (e.g. for testing or custom paths)
+    local _env_registry="${OIU_REGISTRY:-}"
+    [[ -n "$_env_registry" ]] && export OIU_REGISTRY_OVERRIDE="$_env_registry"
+
+    # Parse global flags and command
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            install|uninstall|update|repair|reinstall|clean|status|info|list|help)
+                command="$1" ;;
+            --user)          force_scope="user" ;;
+            --system)        force_scope="system" ;;
+            --dry-run)       dry_run=1; export OIU_DRY_RUN=1 ;;
+            --debug)         debug=1; set -x ;;
+            --version)       echo "OIU v$OIU_VERSION"; exit 0 ;;
+            --no-update-check) export OIU_NO_UPDATE_CHECK=1 ;;
+            *)               extra_args+=("$1") ;;
+        esac
+        shift
+    done
+
+    # Load conf (not needed for info/list/help)
+    if [[ "$command" != "info" && "$command" != "help" ]]; then
+        local conf
+        conf=$(_oiu_find_conf) || die "oiu.conf not found. Is this an OIU-enabled project?"
+        _oiu_parse_conf "$conf"
+        _oiu_resolve_scope "$force_scope"
+    fi
+
+    # Route command
+    case "$command" in
+        install)   cmd_install "${extra_args[@]}" ;;
+        uninstall) cmd_uninstall "${extra_args[@]}" ;;
+        update)    cmd_update "${extra_args[@]}" ;;
+        repair)    cmd_repair ;;
+        reinstall) cmd_reinstall ;;
+        clean)     cmd_clean ;;
+        status)    cmd_status ;;
+        info)      cmd_info ;;
+        list)      cmd_list ;;
+        help)      cmd_help ;;
+        "")        cmd_default ;;
+        *)         die "Unknown command: $command. Run './oiu help'" ;;
+    esac
+}
+
+main "$@"
