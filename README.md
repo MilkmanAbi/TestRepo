@@ -1,4 +1,7 @@
-# ytcui 🐱
+# TEST REPO Only - Please go to https://github.com/MilkmanAbi/ytcui for actual main project
+
+
+#  ytcui (OIS test repo)
 
 > **v3.0.0 with playlist features, better history tab, clickable links delayed slightly because I'm having a horrible code block, can't code well at the moment, brain tired.
 > **v2.5.0** — Cross-platform release! Now runs natively on macOS and BSD!
